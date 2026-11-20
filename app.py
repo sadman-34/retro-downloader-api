@@ -1,76 +1,86 @@
-from flask import Flask, request, jsonify, redirect
+import os
+import time
+import tempfile
+import threading
+from flask import Flask, request, jsonify, send_from_directory
 from flask_cors import CORS
 import yt_dlp
 
 app = Flask(__name__)
-# Allow all domains to access this API (needed for GitHub Pages to connect)
 CORS(app)
 
-# Define quality formats
-FORMATS = {
-    "144p": "best[height<=144]/best",
-    "240p": "best[height<=240]/best",
-    "360p": "best[height<=360]/best",
-}
+# Use Render's temporary directory
+TEMP_DIR = tempfile.gettempdir()
+
+def cleanup_old_files():
+    """Deletes files older than 10 minutes to save space on Render."""
+    while True:
+        time.sleep(600)
+        now = time.time()
+        for f in os.listdir(TEMP_DIR):
+            if f.endswith('.mp4'):
+                filepath = os.path.join(TEMP_DIR, f)
+                if os.path.getmtime(filepath) < now - 600:
+                    try:
+                        os.remove(filepath)
+                    except:
+                        pass
+
+# Start cleanup thread in background
+threading.Thread(target=cleanup_old_files, daemon=True).start()
 
 @app.route('/')
 def home():
-    return "Retro Downloader API is running."
+    return "Retro Downloader API (240p Merge Engine) is running."
 
 @app.route('/download')
 def download():
     url = request.args.get("url", "").strip()
     quality = request.args.get("quality", "240p")
-    wants_json = request.args.get("format") == "json"
 
     if not url:
         return jsonify(ok=False, error="Missing url"), 400
 
-    # SSRF Protection: Ensure the URL is actually http or https
     if not url.startswith("http://") and not url.startswith("https://"):
-        return jsonify(ok=False, error="Invalid URL scheme. Must be http or https."), 400
+        return jsonify(ok=False, error="Invalid URL scheme."), 400
 
+    # Force yt-dlp to grab 240p video + best audio and merge them as mp4
     opts = {
-        "format": FORMATS.get(quality, FORMATS["240p"]),
+        "format": "bestvideo[height<=240]+bestaudio[ext=m4a]/best[height<=240]/best",
+        "outtmpl": os.path.join(TEMP_DIR, "%(id)s.%(ext)s"),
+        "merge_output_format": "mp4",
         "quiet": True,
         "noplaylist": True,
-        "skip_download": True,
-        # Use a mobile user agent to help bypass some blocks
         "user_agent": "Mozilla/5.0 (Android 4.4; Mobile; rv:41.0) Gecko/41.0 Firefox/41.0"
     }
 
     try:
         with yt_dlp.YoutubeDL(opts) as ydl:
-            # Extract info without downloading
-            info = ydl.extract_info(url, download=False)
+            # THIS ACTUALLY DOWNLOADS AND MERGES THE FILE
+            info = ydl.extract_info(url, download=True)
             
-            direct_url = info.get("url")
-            if not direct_url:
-                # Fallback: look through requested formats if direct url is missing
-                formats = info.get("formats", [])
-                if formats:
-                    direct_url = formats[-1].get("url")
-
-            if not direct_url:
-                return jsonify(ok=False, error="No playable stream found for this video."), 502
-
+            video_id = info.get("id")
             title = info.get("title", "Video")
-
-            # Return JSON for the JavaScript frontend
-            if wants_json:
-                return jsonify(
-                    ok=True,
-                    title=title,
-                    quality=quality,
-                    download_url=direct_url
-                )
+            final_filename = f"{video_id}.mp4"
             
-            # Fallback for Opera Mini without JS: redirect directly to the file
-            return redirect(direct_url, code=302)
+            # Get the public URL of your Render backend
+            host_url = request.host_url.rstrip('/')
+            download_link = f"{host_url}/file/{final_filename}"
+
+            return jsonify(
+                ok=True,
+                title=title,
+                quality="240p",
+                download_url=download_link
+            )
 
     except Exception as exc:
-        # Return error message if yt-dlp fails (e.g., age restriction, private video)
         return jsonify(ok=False, error=str(exc)[:150]), 502
+
+@app.route('/file/<filename>')
+def serve_file(filename):
+    """Serves the merged MP4 file to the phone."""
+    return send_from_directory(TEMP_DIR, filename, as_attachment=True)
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8000)
