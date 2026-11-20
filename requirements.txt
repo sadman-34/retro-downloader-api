@@ -1,4 +1,4 @@
-flask
-flask-cors
+Flask==3.0.3
 yt-dlp
-gunicorn
+Flask-Cors==4.0.1
+gunicorn==21.2.0
