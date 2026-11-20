@@ -16,6 +16,28 @@ HEADERS = {
 }
 
 
+def normalize_input_url(url):
+    """Normalize mobile/shortcut URLs so yt-dlp extractors match cleanly."""
+    u = url.strip()
+    if not re.match(r"^https?://", u, re.IGNORECASE):
+        u = "https://" + u
+
+    # Convert xnxx.com/mobile/... to www.xnxx.com/...
+    u = re.sub(
+        r"^https?://(www\.|m\.)?xnxx\.com/mobile/",
+        "https://www.xnxx.com/",
+        u,
+        flags=re.IGNORECASE,
+    )
+    u = re.sub(
+        r"^https?://m\.xnxx\.com/",
+        "https://www.xnxx.com/",
+        u,
+        flags=re.IGNORECASE,
+    )
+    return u
+
+
 def format_duration(val):
     if not val:
         return ""
@@ -30,21 +52,29 @@ def format_duration(val):
 
 
 def is_direct_progressive(fmt):
-    """Return True if format is a direct downloadable file rather than an m3u8/DASH playlist."""
+    """Accept direct HTTP MP4/3GP streams even if vcodec/acodec metadata is omitted."""
     url = fmt.get("url") or ""
     if not url.startswith("http"):
         return False
-    if ".m3u8" in url.lower() or ".mpd" in url.lower():
+
+    lower_url = url.lower()
+    if ".m3u8" in lower_url or ".mpd" in lower_url or ".ts" in lower_url:
         return False
 
     proto = (fmt.get("protocol") or "").lower()
     if "m3u8" in proto or "dash" in proto:
         return False
 
-    # Must have video (unless audio-only requested) and avoid HLS/DASH segment protocols
-    vcodec = fmt.get("vcodec") or "none"
-    acodec = fmt.get("acodec") or "none"
-    return vcodec != "none" and acodec != "none"
+    # Exclude known audio-only tracks
+    vcodec = (fmt.get("vcodec") or "").lower()
+    fmt_id = (fmt.get("format_id") or "").lower()
+    ext = (fmt.get("ext") or "").lower()
+    if vcodec == "none" or ext in ("m4a", "mp3", "ogg", "opus", "aac"):
+        return False
+    if "audio" in fmt_id and "video" not in fmt_id:
+        return False
+
+    return True
 
 
 def pick_best_direct_format(info, quality):
@@ -61,8 +91,7 @@ def pick_best_direct_format(info, quality):
                 and ".m3u8" not in url.lower()
                 and "m3u8" not in proto
                 and "dash" not in proto
-                and (f.get("vcodec") == "none" or not f.get("vcodec"))
-                and (f.get("acodec") and f.get("acodec") != "none")
+                and ((f.get("vcodec") or "").lower() == "none" or (f.get("ext") or "").lower() in ("m4a", "mp3"))
             ):
                 audio_cands.append(f)
         if audio_cands:
@@ -80,10 +109,17 @@ def pick_best_direct_format(info, quality):
     candidates = [f for f in formats if is_direct_progressive(f)]
 
     if candidates:
-        # Score formats: prefer at-or-below target_h, mp4/3gp container, and higher resolution up to target_h
         def score_fmt(f):
             h = f.get("height") or 0
             ext = (f.get("ext") or "").lower()
+            fmt_id = (f.get("format_id") or "").lower()
+
+            # Handle sites like XNXX that label formats 'mp4-low' / 'mp4-high' without height numbers
+            if h == 0 and "low" in fmt_id:
+                h = 240
+            elif h == 0 and "high" in fmt_id:
+                h = 480
+
             within_cap = 1 if (0 < h <= target_h) else (0 if h == 0 else -1)
             ext_rank = 2 if ext == "mp4" else (1 if ext == "3gp" else 0)
             return (within_cap, ext_rank, h if h <= target_h else -h, f.get("tbr") or 0)
@@ -92,7 +128,6 @@ def pick_best_direct_format(info, quality):
         best = candidates[-1]
         return best.get("url"), best.get("filesize") or best.get("filesize_approx")
 
-    # Fallback to top-level info url only if it isn't an m3u8 manifest
     top_url = info.get("url") or ""
     if top_url and ".m3u8" not in top_url.lower():
         return top_url, info.get("filesize") or info.get("filesize_approx")
@@ -100,181 +135,20 @@ def pick_best_direct_format(info, quality):
     return None, None
 
 
-def search_ytdlp_flat(target, site, limit=6):
-    ydl_opts = {
-        "extract_flat": "in_playlist",
-        "playlistend": limit,
-        "quiet": True,
-        "no_warnings": True,
-        "ignoreerrors": True,
-        "socket_timeout": 12,
-    }
-    results = []
-    try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(target, download=False)
-            entries = (info or {}).get("entries") or []
-            for item in entries:
-                if not item:
-                    continue
-                url = item.get("url") or item.get("webpage_url") or ""
-                if url and not url.startswith("http"):
-                    if site == "youtube":
-                        url = "https://www.youtube.com/watch?v=" + url
-                    elif site == "xnxx":
-                        url = "https://www.xnxx.com" + (url if url.startswith("/") else "/" + url)
-                    elif site == "beeg":
-                        url = "https://beeg.com" + (url if url.startswith("/") else "/" + url)
-
-                if not url:
-                    continue
-
-                lower_u = url.lower()
-                if any(bad in lower_u for bad in ["/channel/", "/@", "/playlist", "/photo", "/photos", "/category/"]):
-                    continue
-
-                results.append({
-                    "title": item.get("title") or "Untitled Video",
-                    "url": url,
-                    "duration": format_duration(item.get("duration_string") or item.get("duration")),
-                })
-                if len(results) >= limit:
-                    break
-    except Exception:
-        return []
-    return results
-
-
-def search_web_videos(query, domain_filter, url_pattern, limit=6):
-    endpoints = [
-        ("https://lite.duckduckgo.com/lite/", {"q": f"{domain_filter} {query}"}),
-        ("https://html.duckduckgo.com/html/", {"q": f"{domain_filter} {query}"}),
-    ]
-    results = []
-    seen = set()
-
-    for base_url, params in endpoints:
-        data = urllib.parse.urlencode(params).encode("utf-8")
-        req = urllib.request.Request(base_url, data=data, headers=HEADERS)
-        try:
-            with urllib.request.urlopen(req, timeout=12) as resp:
-                body = resp.read().decode("utf-8", errors="ignore")
-        except Exception:
-            continue
-
-        links = re.findall(r'<a[^>]+href="([^"]+)"[^>]*>(.*?)</a>', body, re.IGNORECASE | re.DOTALL)
-        for raw_href, raw_title in links:
-            href = html.unescape(raw_href)
-            if "uddg=" in href:
-                parsed = urllib.parse.parse_qs(urllib.parse.urlparse(href).query)
-                real_url = parsed.get("uddg", [""])[0]
-            else:
-                real_url = href
-
-            if not real_url or real_url in seen:
-                continue
-            if not re.search(url_pattern, real_url, re.IGNORECASE):
-                continue
-
-            seen.add(real_url)
-            title = re.sub(r"<[^>]+>", "", html.unescape(raw_title)).strip()
-            results.append({
-                "title": title or "Video Post",
-                "url": real_url,
-                "duration": "",
-            })
-            if len(results) >= limit:
-                break
-
-        if results:
-            break
-
-    return results
-
-
 @app.route("/")
 def home():
     return jsonify({"status": "ok", "service": "retro-downloader-api"})
 
 
-@app.route("/api/search")
-def search():
-    site = request.args.get("site", "youtube").strip().lower()
-    query = request.args.get("q", "").strip()
-
-    if not query:
-        return jsonify({"error": "Enter a search keyword."}), 400
-
-    encoded_q = urllib.parse.quote_plus(query)
-    results = []
-    note = ""
-
-    if site == "youtube":
-        results = search_ytdlp_flat(f"ytsearch6:{query}", "youtube", 6)
-        if not results:
-            results = search_web_videos(
-                query,
-                "site:youtube.com/watch",
-                r"https?://(www\.|m\.)?(youtube\.com/watch\?v=|youtu\.be/)",
-                6,
-            )
-    elif site == "pornhub":
-        results = search_ytdlp_flat(f"https://www.pornhub.com/video/search?search={encoded_q}", "pornhub", 6)
-        if not results:
-            results = search_web_videos(
-                query,
-                "site:pornhub.com/view_video.php",
-                r"https?://([a-z]+\.)?pornhub\.com/view_video\.php\?viewkey=",
-                6,
-            )
-    elif site == "xnxx":
-        results = search_ytdlp_flat(f"https://www.xnxx.com/search/{encoded_q}", "xnxx", 6)
-        if not results:
-            results = search_web_videos(
-                query,
-                "site:xnxx.com/video-",
-                r"https?://(www\.)?xnxx\.com/video-",
-                6,
-            )
-    elif site == "beeg":
-        results = search_ytdlp_flat(f"https://beeg.com/search?q={encoded_q}", "beeg", 6)
-        if not results:
-            results = search_web_videos(
-                query,
-                "site:beeg.com",
-                r"https?://(www\.)?beeg\.com/[^/?#]+",
-                6,
-            )
-    elif site == "x":
-        results = search_web_videos(
-            query,
-            "(site:x.com OR site:twitter.com)",
-            r"https?://(www\.)?(x|twitter)\.com/[^/]+/status/\d+",
-            6,
-        )
-    elif site == "facebook":
-        results = search_web_videos(
-            query,
-            "site:facebook.com",
-            r"https?://(www\.|m\.)?facebook\.com/(watch|reel/|[^/]+/videos/)",
-            6,
-        )
-    else:
-        return jsonify({"error": "Unsupported site selected."}), 400
-
-    if not results:
-        note = f"No video results returned from Render for {site}. Paste a direct video link instead."
-
-    return jsonify({"results": results, "note": note})
-
-
 @app.route("/api/extract")
 def extract():
-    url = request.args.get("url", "").strip()
+    raw_url = request.args.get("url", "").strip()
     quality = request.args.get("quality", "240p")
 
-    if not url:
+    if not raw_url:
         return jsonify({"error": "No URL provided"}), 400
+
+    url = normalize_input_url(raw_url)
 
     ydl_opts = {
         "quiet": True,
@@ -292,7 +166,7 @@ def extract():
             direct_url, size_bytes = pick_best_direct_format(info, quality)
             if not direct_url:
                 return jsonify({
-                    "error": "This video only provides HLS (.m3u8) chunks and no direct MP4/3GP file."
+                    "error": "No direct MP4/3GP file found (only HLS .m3u8 stream available)."
                 }), 404
 
             size_bytes = size_bytes or info.get("filesize") or info.get("filesize_approx")
