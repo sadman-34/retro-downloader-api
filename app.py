@@ -2,7 +2,6 @@ from flask import Flask, request, jsonify
 from flask_cors import CORS
 import urllib.parse
 import urllib.request
-import json
 import re
 import html
 import yt_dlp
@@ -28,6 +27,77 @@ def format_duration(val):
             return f"{secs // 3600}:{(secs % 3600) // 60:02d}:{secs % 60:02d}"
         return f"{secs // 60}:{secs % 60:02d}"
     return ""
+
+
+def is_direct_progressive(fmt):
+    """Return True if format is a direct downloadable file rather than an m3u8/DASH playlist."""
+    url = fmt.get("url") or ""
+    if not url.startswith("http"):
+        return False
+    if ".m3u8" in url.lower() or ".mpd" in url.lower():
+        return False
+
+    proto = (fmt.get("protocol") or "").lower()
+    if "m3u8" in proto or "dash" in proto:
+        return False
+
+    # Must have video (unless audio-only requested) and avoid HLS/DASH segment protocols
+    vcodec = fmt.get("vcodec") or "none"
+    acodec = fmt.get("acodec") or "none"
+    return vcodec != "none" and acodec != "none"
+
+
+def pick_best_direct_format(info, quality):
+    """Choose a direct non-m3u8 video (or audio) format matching quality."""
+    formats = info.get("formats") or []
+
+    if quality == "audio":
+        audio_cands = []
+        for f in formats:
+            url = f.get("url") or ""
+            proto = (f.get("protocol") or "").lower()
+            if (
+                url.startswith("http")
+                and ".m3u8" not in url.lower()
+                and "m3u8" not in proto
+                and "dash" not in proto
+                and (f.get("vcodec") == "none" or not f.get("vcodec"))
+                and (f.get("acodec") and f.get("acodec") != "none")
+            ):
+                audio_cands.append(f)
+        if audio_cands:
+            audio_cands.sort(key=lambda x: (
+                1 if (x.get("ext") in ("m4a", "mp3")) else 0,
+                x.get("abr") or 0,
+                x.get("tbr") or 0,
+            ))
+            best_a = audio_cands[-1]
+            return best_a.get("url"), best_a.get("filesize") or best_a.get("filesize_approx")
+
+    height_map = {"144p": 144, "240p": 240, "360p": 360}
+    target_h = height_map.get(quality, 240)
+
+    candidates = [f for f in formats if is_direct_progressive(f)]
+
+    if candidates:
+        # Score formats: prefer at-or-below target_h, mp4/3gp container, and higher resolution up to target_h
+        def score_fmt(f):
+            h = f.get("height") or 0
+            ext = (f.get("ext") or "").lower()
+            within_cap = 1 if (0 < h <= target_h) else (0 if h == 0 else -1)
+            ext_rank = 2 if ext == "mp4" else (1 if ext == "3gp" else 0)
+            return (within_cap, ext_rank, h if h <= target_h else -h, f.get("tbr") or 0)
+
+        candidates.sort(key=score_fmt)
+        best = candidates[-1]
+        return best.get("url"), best.get("filesize") or best.get("filesize_approx")
+
+    # Fallback to top-level info url only if it isn't an m3u8 manifest
+    top_url = info.get("url") or ""
+    if top_url and ".m3u8" not in top_url.lower():
+        return top_url, info.get("filesize") or info.get("filesize_approx")
+
+    return None, None
 
 
 def search_ytdlp_flat(target, site, limit=6):
@@ -76,7 +146,6 @@ def search_ytdlp_flat(target, site, limit=6):
 
 
 def search_web_videos(query, domain_filter, url_pattern, limit=6):
-    """Search for video-only pages via DuckDuckGo Lite/HTML."""
     endpoints = [
         ("https://lite.duckduckgo.com/lite/", {"q": f"{domain_filter} {query}"}),
         ("https://html.duckduckgo.com/html/", {"q": f"{domain_filter} {query}"}),
@@ -93,7 +162,6 @@ def search_web_videos(query, domain_filter, url_pattern, limit=6):
         except Exception:
             continue
 
-        # Match links in both DuckDuckGo Lite and HTML layouts
         links = re.findall(r'<a[^>]+href="([^"]+)"[^>]*>(.*?)</a>', body, re.IGNORECASE | re.DOTALL)
         for raw_href, raw_title in links:
             href = html.unescape(raw_href)
@@ -195,7 +263,7 @@ def search():
         return jsonify({"error": "Unsupported site selected."}), 400
 
     if not results:
-        note = f"No video results returned from Render for {site} (site may block cloud search). Paste a direct video link instead."
+        note = f"No video results returned from Render for {site}. Paste a direct video link instead."
 
     return jsonify({"results": results, "note": note})
 
@@ -208,15 +276,7 @@ def extract():
     if not url:
         return jsonify({"error": "No URL provided"}), 400
 
-    height_map = {"144p": 144, "240p": 240, "360p": 360}
-    if quality == "audio":
-        fmt = "bestaudio[ext=m4a]/bestaudio"
-    else:
-        max_h = height_map.get(quality, 240)
-        fmt = f"best[height<={max_h}][ext=mp4]/best[height<={max_h}]/best"
-
     ydl_opts = {
-        "format": fmt,
         "quiet": True,
         "no_warnings": True,
         "noplaylist": True,
@@ -226,14 +286,16 @@ def extract():
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=False)
-            if not info or (info.get("vcodec") == "none" and quality != "audio"):
-                return jsonify({"error": "Selected post does not contain a video."}), 400
+            if not info:
+                return jsonify({"error": "Could not read video info."}), 400
 
-            direct_url = info.get("url")
+            direct_url, size_bytes = pick_best_direct_format(info, quality)
             if not direct_url:
-                return jsonify({"error": "Could not find a direct video stream URL."}), 404
+                return jsonify({
+                    "error": "This video only provides HLS (.m3u8) chunks and no direct MP4/3GP file."
+                }), 404
 
-            size_bytes = info.get("filesize") or info.get("filesize_approx")
+            size_bytes = size_bytes or info.get("filesize") or info.get("filesize_approx")
             size_str = f"{round(size_bytes / (1024 * 1024), 1)} MB" if size_bytes else ""
 
             return jsonify({
