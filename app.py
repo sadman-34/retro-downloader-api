@@ -38,8 +38,11 @@ def download():
         return jsonify(ok=False, error="Invalid URL."), 400
 
     opts = {
-        # Strict 240p. If not available, it fails. NO '/worst' fallback.
-        "format": "bestvideo[height<=240]+bestaudio/best[height<=240]",
+        # 1. Try 240p video + audio.
+        # 2. Try a muxed 240p file.
+        # 3. FALLBACK: If the site has NO 240p at all, grab the 'worst' (smallest) file available.
+        "format": "bestvideo[height<=240]+bestaudio/best[height<=240]/worst",
+        "format_sort": ["res:240", "size"], # Force lowest resolution and smallest size
         "outtmpl": os.path.join(TEMP_DIR, "%(id)s.%(ext)s"),
         "merge_output_format": "mp4",
         "quiet": True,
@@ -68,20 +71,15 @@ def download():
             return jsonify(
                 ok=True,
                 title=title,
-                quality="240p",
+                quality="Smallest Available",
                 download_url=download_link
             )
 
     except Exception as exc:
         error_msg = str(exc)
         
-        # Handle the 50MB size limit
         if "File is larger than max-filesize" in error_msg:
-             return jsonify(ok=False, error="This site's lowest quality is over 50MB. Try a shorter video."), 400
-             
-        # Handle when a site doesn't have 240p at all
-        if "Requested format is not available" in error_msg:
-             return jsonify(ok=False, error="This site does not offer a 240p version."), 400
+             return jsonify(ok=False, error="Even the lowest quality on this site is over 50MB. Try a shorter video."), 400
              
         return jsonify(ok=False, error=error_msg[:150]), 502
 
