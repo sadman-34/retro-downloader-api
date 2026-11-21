@@ -16,7 +16,8 @@ def cleanup_old_files():
         time.sleep(600)
         now = time.time()
         for f in os.listdir(TEMP_DIR):
-            if f.endswith('.mp4'):
+            # Clean up any downloaded video or audio files
+            if f.endswith('.mp4') or f.endswith('.webm') or f.endswith('.3gp') or f.endswith('.m4a'):
                 filepath = os.path.join(TEMP_DIR, f)
                 if os.path.getmtime(filepath) < now - 600:
                     try:
@@ -28,21 +29,15 @@ threading.Thread(target=cleanup_old_files, daemon=True).start()
 
 @app.route('/')
 def home():
-    return "Retro Downloader API (240p Engine) is running."
+    return "Retro Downloader API is running."
 
 @app.route('/download')
 def download():
     url = request.args.get("url", "").strip()
-    quality = request.args.get("quality", "240p")
 
-    if not url:
-        return jsonify(ok=False, error="Missing url"), 400
+    if not url or not url.startswith("http"):
+        return jsonify(ok=False, error="Invalid URL."), 400
 
-    if not url.startswith("http://") and not url.startswith("https://"):
-        return jsonify(ok=False, error="Invalid URL scheme."), 400
-
-    # Strict 240p. If it fails, fallback to 'worst' (144p), NEVER '/best'.
-    # max_filesize is now strictly 25MB
     opts = {
         "format": "bestvideo[height<=240]+bestaudio/best[height<=240]/worst",
         "outtmpl": os.path.join(TEMP_DIR, "%(id)s.%(ext)s"),
@@ -57,12 +52,20 @@ def download():
         with yt_dlp.YoutubeDL(opts) as ydl:
             info = ydl.extract_info(url, download=True)
             
-            video_id = info.get("id")
+            # Get the EXACT file path that yt-dlp saved
+            filepath = None
+            if 'requested_downloads' in info and info['requested_downloads']:
+                filepath = info['requested_downloads'][0].get('filepath')
+            
+            # If yt-dlp aborted due to the 25MB limit, filepath won't exist
+            if not filepath or not os.path.exists(filepath):
+                return jsonify(ok=False, error="Video exceeds 25MB limit or failed to download. Try a shorter video."), 400
+
+            actual_filename = os.path.basename(filepath)
             title = info.get("title", "Video")
-            final_filename = f"{video_id}.mp4"
             
             host_url = request.host_url.rstrip('/')
-            download_link = f"{host_url}/file/{final_filename}"
+            download_link = f"{host_url}/file/{actual_filename}"
 
             return jsonify(
                 ok=True,
@@ -72,7 +75,6 @@ def download():
             )
 
     except Exception as exc:
-        # If the file was too big, yt-dlp throws an error here
         error_msg = str(exc)
         if "File is larger than max-filesize" in error_msg:
              return jsonify(ok=False, error="Video is over 25MB. Try a shorter video."), 400
@@ -80,8 +82,8 @@ def download():
 
 @app.route('/file/<filename>')
 def serve_file(filename):
-    # Force the download with headers Opera Mini understands
-    response = send_from_directory(TEMP_DIR, filename, as_attachment=True, mimetype="video/mp4")
+    # We use application/octet-stream so Opera Mini downloads it instead of trying to play it
+    response = send_from_directory(TEMP_DIR, filename, as_attachment=True, mimetype="application/octet-stream")
     response.headers["Content-Disposition"] = f"attachment; filename={filename}"
     return response
 
