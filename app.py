@@ -16,6 +16,7 @@ def cleanup_old_files():
         time.sleep(600)
         now = time.time()
         for f in os.listdir(TEMP_DIR):
+            # Clean up any downloaded video or audio files
             if f.endswith('.mp4') or f.endswith('.webm') or f.endswith('.3gp') or f.endswith('.m4a'):
                 filepath = os.path.join(TEMP_DIR, f)
                 if os.path.getmtime(filepath) < now - 600:
@@ -38,16 +39,12 @@ def download():
         return jsonify(ok=False, error="Invalid URL."), 400
 
     opts = {
-        # 1. Try 240p video + audio.
-        # 2. Try a muxed 240p file.
-        # 3. FALLBACK: If the site has NO 240p at all, grab the 'worst' (smallest) file available.
         "format": "bestvideo[height<=240]+bestaudio/best[height<=240]/worst",
-        "format_sort": ["res:240", "size"], # Force lowest resolution and smallest size
         "outtmpl": os.path.join(TEMP_DIR, "%(id)s.%(ext)s"),
         "merge_output_format": "mp4",
         "quiet": True,
         "noplaylist": True,
-        "max_filesize": 50 * 1024 * 1024, # Strict 50MB limit
+        "max_filesize": 50 * 1024 * 1024, # CHANGED TO 50MB HERE
         "user_agent": "Mozilla/5.0 (Android 4.4; Mobile; rv:41.0) Gecko/41.0 Firefox/41.0"
     }
 
@@ -55,12 +52,14 @@ def download():
         with yt_dlp.YoutubeDL(opts) as ydl:
             info = ydl.extract_info(url, download=True)
             
+            # Get the EXACT file path that yt-dlp saved
             filepath = None
             if 'requested_downloads' in info and info['requested_downloads']:
                 filepath = info['requested_downloads'][0].get('filepath')
             
+            # If yt-dlp aborted due to the 50MB limit, filepath won't exist
             if not filepath or not os.path.exists(filepath):
-                return jsonify(ok=False, error="Video exceeds 50MB or failed to download."), 400
+                return jsonify(ok=False, error="Video exceeds 50MB limit or failed to download. Try a shorter video."), 400
 
             actual_filename = os.path.basename(filepath)
             title = info.get("title", "Video")
@@ -71,20 +70,19 @@ def download():
             return jsonify(
                 ok=True,
                 title=title,
-                quality="Smallest Available",
+                quality="240p",
                 download_url=download_link
             )
 
     except Exception as exc:
         error_msg = str(exc)
-        
         if "File is larger than max-filesize" in error_msg:
-             return jsonify(ok=False, error="Even the lowest quality on this site is over 50MB. Try a shorter video."), 400
-             
+             return jsonify(ok=False, error="Video is over 50MB. Try a shorter video."), 400
         return jsonify(ok=False, error=error_msg[:150]), 502
 
 @app.route('/file/<filename>')
 def serve_file(filename):
+    # Use application/octet-stream so Opera Mini downloads it instead of trying to play it
     response = send_from_directory(TEMP_DIR, filename, as_attachment=True, mimetype="application/octet-stream")
     response.headers["Content-Disposition"] = f"attachment; filename={filename}"
     return response
